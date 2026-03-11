@@ -1,0 +1,32 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Production environment — tighter settings, HA config, no cost shortcuts
+# ─────────────────────────────────────────────────────────────────────────────
+
+project_name = "rhoai-prod"
+environment  = "production"
+owner_tag    = "YOUR_TEAM@company.com"
+aws_region   = "us-east-1"
+
+# ── Network — 3 AZs for production HA ────────────────────────────────────────
+vpc_cidr             = "10.10.0.0/16"
+availability_zones   = ["us-east-1a", "us-east-1b", "us-east-1c"]
+public_subnet_cidrs  = ["10.10.101.0/24", "10.10.102.0/24", "10.10.103.0/24"]
+private_subnet_cidrs = ["10.10.1.0/24",   "10.10.2.0/24",   "10.10.3.0/24"]
+
+# ── ROSA — production sizing ──────────────────────────────────────────────────
+rosa_cluster_name    = "rhoai-prod"
+ocp_version          = "4.15.28"
+worker_instance_type = "c5.4xlarge"   # 16vCPU, 32GB
+worker_min_replicas  = 3
+worker_max_replicas  = 12
+
+# ── Aurora — production hardened ─────────────────────────────────────────────
+aurora_min_acu             = 2
+aurora_max_acu             = 16
+aurora_skip_snapshot       = false    # REQUIRED for production
+aurora_deletion_protection = true     # REQUIRED for production
+aurora_backup_retention    = 14
+
+# ── Cost — higher budget for production ──────────────────────────────────────
+monthly_budget_usd  = 5000
+budget_alert_email  = "ops-team@company.com"
