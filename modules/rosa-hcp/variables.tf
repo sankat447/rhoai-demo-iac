@@ -101,3 +101,15 @@ variable "tags" {
   type    = map(string)
   default = {}
 }
+
+variable "public_subnet_ids" {
+  description = "Public subnet IDs from VPC module — required for public NLB ingress."
+  type        = list(string)
+  default     = []
+}
+
+variable "private" {
+  description = "Set true for private cluster (no public API/console). False for demo access."
+  type        = bool
+  default     = false
+}

@@ -66,23 +66,22 @@ module "s3" {
 # ─────────────────────────────────────────────────────────────────────────────
 module "rosa" {
   source = "../../modules/rosa-hcp"
-
   cluster_name         = var.rosa_cluster_name
   aws_region           = var.aws_region
   ocp_version          = var.ocp_version
   vpc_cidr             = var.vpc_cidr
   private_subnet_ids   = module.vpc.private_subnet_ids
+  public_subnet_ids    = module.vpc.public_subnet_ids
+  private              = false
   availability_zones   = var.availability_zones
   oidc_config_id       = var.oidc_config_id
   account_role_prefix  = var.account_role_prefix
-
   worker_instance_type = var.worker_instance_type
   worker_min_replicas  = var.worker_min_replicas
   worker_max_replicas  = var.worker_max_replicas
   create_gpu_pool      = var.create_gpu_pool
   gpu_instance_type    = var.gpu_instance_type
   gpu_max_replicas     = var.gpu_max_replicas
-
   tags       = local.tags
   depends_on = [module.vpc]
 }

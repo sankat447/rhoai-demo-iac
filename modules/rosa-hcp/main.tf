@@ -27,7 +27,7 @@ resource "rhcs_cluster_rosa_hcp" "this" {
   aws_account_id         = local.account_id
   aws_billing_account_id = local.account_id
 
-  aws_subnet_ids     = var.private_subnet_ids
+  aws_subnet_ids     = concat(var.private_subnet_ids, var.public_subnet_ids)
   availability_zones = var.availability_zones
 
   machine_cidr = var.vpc_cidr
@@ -35,7 +35,7 @@ resource "rhcs_cluster_rosa_hcp" "this" {
   pod_cidr     = "10.128.0.0/14"
   host_prefix  = 23
 
-  private           = true
+  private           = var.private
   create_admin_user = true
 
   properties = {
