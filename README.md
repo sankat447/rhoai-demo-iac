@@ -1,376 +1,320 @@
-# RHOAI Demo IaC — AWS + ROSA Platform Terraform
+# RHOAI on AWS — ROSA HCP Infrastructure as Code
 
-> **Platform-Level Infrastructure as Code** for the Red Hat OpenShift AI (RHOAI) demo environment on AWS with ROSA Hosted Control Plane.
-
----
-
-## 📐 Scope — What This Repo Covers
-
-This repository manages the **platform layer only**:
-
-| Layer | This Repo | Separate GitOps Repo |
-|-------|-----------|---------------------|
-| VPC + Networking | ✅ | |
-| ROSA HCP Cluster | ✅ | |
-| ROSA Machine Pools (Workers + GPU) | ✅ | |
-| IAM / IRSA Roles | ✅ | |
-| Aurora Serverless v2 + pgvector | ✅ | |
-| S3 Data Lake Buckets | ✅ | |
-| EFS Storage (Jupyter PVCs) | ✅ | |
-| ECR Repositories | ✅ | |
-| Lambda Schedulers + Budget Alerts | ✅ | |
-| RHOAI Operator Installation | | ✅ (ArgoCD) |
-| ArgoCD Bootstrap | | ✅ (ArgoCD) |
-| Open WebUI, n8n, Redis, MongoDB pods | | ✅ (Helm/ArgoCD) |
-| LangChain / LangServe deployments | | ✅ (Helm/ArgoCD) |
-| vLLM ServingRuntime YAML | | ✅ (GitOps) |
+> Terraform IaC for Red Hat OpenShift AI (RHOAI) on AWS using ROSA Hosted Control Plane (HCP).  
+> Account: `406337554361` (iis-lab) · Region: `us-east-1` · Guide version: **v3**
 
 ---
 
-## 🏗️ Architecture — Module Overview
+## Architecture
 
 ```
-modules/
-├── vpc/                  ← VPC, public/private subnets, NAT Gateway, route tables
-├── rosa-hcp/             ← ROSA HCP cluster, worker pool (Spot), GPU pool (starts at 0)
-├── iam-irsa/             ← IAM roles federated via OIDC (S3, Bedrock, ECR, SSM)
-├── aurora-serverless/    ← Aurora PostgreSQL Serverless v2 + pgvector extension
-├── s3-data-lake/         ← Data lake bucket, Terraform state bucket, DynamoDB lock
-├── efs-storage/          ← EFS for ReadWriteMany PVCs (Jupyter notebooks)
-├── ecr-repos/            ← ECR container image repositories + lifecycle policies
-└── lambda-triggers/      ← Demo scheduler (start/stop cron) + budget alerts
-
-environments/
-├── demo/                 ← FILL IN: terraform.tfvars (copy from .example)
-└── prod/                 ← FILL IN: terraform.tfvars for production
+┌─────────────────────────────────────────────────────────┐
+│  AWS Account 406337554361  ·  us-east-1                 │
+│                                                         │
+│  VPC 10.0.0.0/16                                        │
+│  ├── Public Subnets  (NAT GW, bastion)                  │
+│  └── Private Subnets (ROSA nodes, Aurora, EFS)          │
+│                                                         │
+│  Phase 1 — Platform                                     │
+│  ├── Aurora Serverless v2  (PostgreSQL 16.4 + pgvector) │
+│  ├── EFS                   (RWX PVCs for notebooks)     │
+│  ├── S3                    (data lake / model storage)  │
+│  ├── ECR                   (container registry)         │
+│  └── Lambda                (demo start/stop scheduler)  │
+│                                                         │
+│  Phase 2 — Cluster                                      │
+│  ├── ROSA HCP cluster      (OCP 4.17.50)                │
+│  ├── compute pool          (c5.2xlarge, autoscale 1-4)  │
+│  ├── gpu-demo pool         (g4dn.xlarge, scale 0-1)     │
+│  └── IAM / IRSA roles      (S3, Bedrock, ECR, SSM)      │
+└─────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 🚀 Quick Start — First Time Setup
+## Quick Start
 
-### Prerequisites on your MacBook
+### First time ever (one-time setup)
 
 ```bash
-# Install required tools (one-time)
-brew install tfenv awscli rosa-cli openshift-cli helm argocd
-tfenv install 1.8.5 && tfenv use 1.8.5
+# 1. Install tools
+brew install terraform awscli rosa-cli watch pre-commit
 
-# Verify
-terraform version    # Should show 1.8.5
-rosa version         # Should show 1.x.x
-aws --version        # Should show 2.x.x
+# 2. Install oc CLI
+rosa download oc && tar xzf openshift-client-mac.tar.gz
+sudo mv oc kubectl /usr/local/bin/
+
+# 3. Bootstrap remote state
+./scripts/bootstrap-state.sh
+
+# 4. Create account roles (ONCE per AWS account — never re-run)
+rosa login
+rosa create account-roles --hosted-cp --prefix rhoai-demo --yes
+
+# 5. Create OIDC config (ONCE — reuse across all redeployments)
+rosa create oidc-config --managed --yes --region us-east-1
+rosa list oidc-config   # copy the ID into terraform.tfvars
 ```
 
-### Step 1 — Configure AWS credentials
+### Every deployment
 
 ```bash
-# Option A: aws-vault (recommended — credentials in macOS Keychain)
-brew install --cask aws-vault
-aws-vault add rhoai-demo
-# Enter your AWS Access Key ID and Secret
+# Refresh tokens
+aws-login
+rosa login && export RHCS_TOKEN=$(rosa token)
 
-# Option B: AWS SSO (if your org uses SSO)
-aws configure sso --profile rhoai-demo
-
-# Verify
-aws-vault exec rhoai-demo -- aws sts get-caller-identity
-```
-
-### Step 2 — Bootstrap Terraform remote state
-
-> **One-time only.** Creates the S3 bucket and DynamoDB table for storing Terraform state.
-
-```bash
-aws-vault exec rhoai-demo -- ./scripts/bootstrap-state.sh
-```
-
-After it runs, **fill in `environments/demo/backend.tf`** with the bucket name and table name printed at the end.
-
-### Step 3 — Configure your environment variables
-
-```bash
+# Configure
 cd environments/demo
 cp terraform.tfvars.example terraform.tfvars
-# Edit terraform.tfvars — fill in your values (see Configuration Reference below)
+# Edit terraform.tfvars — set owner_tag, budget_alert_email, oidc_config_id
+
+# Deploy
+terraform init
+terraform plan -out=tfplan
+terraform apply tfplan
+
+# Post-apply (operator roles, public ingress, admin user, pgvector)
+cd ../..
+./scripts/post-apply.sh
 ```
 
-**Minimum required values to fill in:**
-
-| Variable | Where to find it | Example |
-|----------|-----------------|---------|
-| `owner_tag` | Your email | `john@company.com` |
-| `budget_alert_email` | Your email | `john@company.com` |
-| `rosa_cluster_name` | Your choice | `rhoai-demo` |
-
-### Step 4 — Get Red Hat OCM Token
-
-1. Go to [console.redhat.com/openshift/token](https://console.redhat.com/openshift/token)
-2. Download the offline token JSON file
-3. Export for Terraform:
+### Redeploy after teardown
 
 ```bash
-export RHCS_TOKEN=$(cat ~/Downloads/rh-ocm-token.json)
-# Add to ~/.zprofile for persistence
-echo 'export RHCS_TOKEN=$(cat ~/rh-ocm-token.json)' >> ~/.zprofile
-```
-
-### Step 5 — Provision the full stack
-
-```bash
-# Full provision (~25-30 minutes — ROSA cluster creation is the slow step)
-aws-vault exec rhoai-demo -- ./scripts/provision.sh
+aws-login
+./scripts/redeploy.sh    # ~35 minutes end-to-end
 ```
 
 ---
 
-## 📋 Configuration Reference
-
-All variables are defined in `environments/demo/variables.tf` with descriptions.
-Set your values in `environments/demo/terraform.tfvars` (never commit this file).
-
-### Key decisions to make in tfvars
-
-#### Network
-| Variable | Demo Default | Production |
-|----------|-------------|------------|
-| `availability_zones` | 2 AZs | 3 AZs |
-| `vpc_cidr` | `10.0.0.0/16` | Different CIDR |
-
-#### ROSA Cluster
-| Variable | Demo Default | Notes |
-|----------|-------------|-------|
-| `worker_instance_type` | `c5.2xlarge` | 8 vCPU / 16GB. See sizing guide below. |
-| `worker_min_replicas` | `2` | Set to `0` when stopped |
-| `ocp_version` | `4.15.28` | Check: `rosa list versions --hosted-cp` |
-| `create_gpu_pool` | `true` | Pool starts at 0 replicas — no cost until needed |
-| `gpu_instance_type` | `g4dn.xlarge` | 16GB T4 — fits 7-8B models with quantization |
-
-#### Worker Instance Type Sizing Guide
-| Type | vCPU | RAM | Use Case | ~Spot Price |
-|------|------|-----|----------|-------------|
-| `c5.2xlarge` | 8 | 16GB | Demo default — general workloads | ~$0.07/hr |
-| `m5.2xlarge` | 8 | 32GB | Memory-heavy workloads (more pods) | ~$0.08/hr |
-| `c5.4xlarge` | 16 | 32GB | Production sizing | ~$0.14/hr |
-
-#### Aurora Serverless v2
-| Variable | Demo | Production |
-|----------|------|------------|
-| `aurora_min_acu` | `0.5` | `2` |
-| `aurora_skip_snapshot` | `true` | **`false`** |
-| `aurora_deletion_protection` | `false` | **`true`** |
-| `aurora_backup_retention` | `1` | `14` |
-
-#### Cost Control Automation
-| Variable | Default | Notes |
-|----------|---------|-------|
-| `monthly_budget_usd` | `700` | Alert fires at 80% and 100% |
-| `demo_start_cron` | `cron(0 8 ? * MON-FRI *)` | 8am UTC weekdays — adjust for your TZ |
-| `demo_stop_cron` | `cron(0 20 ? * MON-FRI *)` | 8pm UTC weekdays |
-
-> **Timezone note:** Cron times are UTC. For IST (UTC+5:30): 8am UTC = 1:30pm IST. Adjust to your timezone.
-
----
-
-## 🎛️ Demo Lifecycle Commands
-
-### Daily operations
-
-```bash
-# Morning — start demo (scale workers from 0 to 2, ~8 min)
-aws-vault exec rhoai-demo -- ./scripts/start-demo.sh
-
-# Evening — stop demo (scale workers to 0)
-aws-vault exec rhoai-demo -- ./scripts/stop-demo.sh
-```
-
-### GPU demo (vLLM)
-
-```bash
-# Before GPU demo — start GPU node (~10 min to be ready)
-aws-vault exec rhoai-demo -- ./scripts/gpu-on.sh
-
-# After GPU demo — remove GPU node (saves ~$0.37/hr spot)
-aws-vault exec rhoai-demo -- ./scripts/gpu-off.sh
-```
-
-### Full provision / destroy
-
-```bash
-# Provision from scratch (first time or after teardown)
-aws-vault exec rhoai-demo -- ./scripts/provision.sh
-
-# Destroy everything (multi-day break, end of sprint)
-aws-vault exec rhoai-demo -- ./scripts/teardown.sh
-```
-
-### Terraform operations (manual)
-
-```bash
-cd environments/demo
-
-# Always plan first — review before applying
-aws-vault exec rhoai-demo -- terraform plan -out=tfplan
-
-# Apply a saved plan
-aws-vault exec rhoai-demo -- terraform apply tfplan
-
-# Inspect outputs
-aws-vault exec rhoai-demo -- terraform output
-
-# Get DB password from SSM (DO NOT use terraform output for this)
-aws-vault exec rhoai-demo -- \
-  aws ssm get-parameter --name /rhoai-demo/aurora/master-password \
-  --with-decryption --query Parameter.Value --output text
-```
-
----
-
-## 💰 Expected Costs
-
-### Demo — Active (workers running, no GPU)
-| Service | Cost/hr | Cost/month |
-|---------|---------|------------|
-| ROSA HCP fee | $0.25 | $183 |
-| ROSA service fee (2×c5.2xlarge) | $0.17 | $125 |
-| EC2 Spot (2×c5.2xlarge) | $0.14 | ~$102 |
-| Aurora Serverless v2 (0.5 ACU) | $0.06 | ~$30 |
-| VPC NAT Gateway | $0.045 | ~$33 |
-| S3 + EFS + ECR | | ~$10 |
-| **Total active** | **~$0.66/hr** | **~$483** |
-
-### Demo — Stopped (workers at 0)
-| Service | Cost/hr | Notes |
-|---------|---------|-------|
-| ROSA HCP fee | $0.25 | Control plane always running |
-| Aurora Serverless v2 | ~$0.03 | Scales to minimum ACU |
-| NAT Gateway | $0.045 | Still running |
-| **Total stopped** | **~$0.35/hr** | **~$255/mo** |
-
-### GPU active (add to above)
-| Service | Cost/hr |
-|---------|---------|
-| g4dn.xlarge Spot | ~$0.37 |
-
-> **Tip:** Use `teardown.sh` when not needed for 3+ days to drop to ~$0.
-
----
-
-## 🔐 Security Practices
-
-1. **No static credentials** — AWS Vault stores credentials in macOS Keychain. GitHub Actions uses OIDC (no static keys in CI).
-2. **No secrets in Terraform** — DB password is auto-generated and stored in SSM Parameter Store. Never appears in `terraform output`.
-3. **No secrets in .tfvars** — Only config values (names, sizes, regions) go in `terraform.tfvars`. Sensitive values come from SSM or environment variables.
-4. **Pre-commit hooks** — `detect-aws-credentials` hook prevents accidental key commits. Run `pre-commit install` after cloning.
-5. **Checkov scanning** — IaC security scanner runs on every commit and in CI.
-6. **Least-privilege IAM** — IRSA roles are scoped to specific namespaces and specific S3 prefixes/Bedrock models.
-
----
-
-## 📂 File Reference
+## Project Structure
 
 ```
-rhoai-demo-iac/
-├── README.md                            ← You are here
-├── .gitignore                           ← Excludes *.tfvars, *.tfstate, .terraform/
-├── .pre-commit-config.yaml              ← Auto-linting on every commit
-│
-├── modules/                             ← Reusable platform modules
-│   ├── vpc/
-│   │   ├── main.tf                      ← VPC, subnets, NAT, route tables
-│   │   ├── variables.tf                 ← Module inputs
-│   │   └── outputs.tf                   ← VPC ID, subnet IDs, etc.
-│   ├── rosa-hcp/
-│   │   ├── main.tf                      ← ROSA cluster, worker + GPU machine pools
-│   │   ├── variables.tf
-│   │   └── outputs.tf                   ← API URL, console URL, OIDC endpoint
-│   ├── iam-irsa/
-│   │   ├── main.tf                      ← 4 IRSA roles (S3, Bedrock, ECR, SSM)
-│   │   ├── variables.tf
-│   │   └── outputs.tf                   ← Role ARNs for service account annotation
-│   ├── aurora-serverless/
-│   │   ├── main.tf                      ← Aurora Serverless v2 + pgvector param group
-│   │   ├── variables.tf
-│   │   ├── outputs.tf
-│   │   └── init.sql                     ← Run after cluster creation to enable pgvector
-│   ├── s3-data-lake/
-│   │   ├── main.tf                      ← Data bucket + tfstate bucket + DynamoDB lock
-│   │   ├── variables.tf
-│   │   └── outputs.tf
-│   ├── efs-storage/
-│   │   ├── main.tf                      ← EFS + mount targets + access point
-│   │   ├── variables.tf
-│   │   └── outputs.tf
-│   ├── ecr-repos/
-│   │   ├── main.tf                      ← ECR repos + lifecycle policies
-│   │   ├── variables.tf
-│   │   └── outputs.tf
-│   └── lambda-triggers/
-│       ├── main.tf                      ← Scheduler Lambda + EventBridge + Budget
-│       ├── variables.tf
-│       └── outputs.tf
-│
+rhoai-iac-v2/
 ├── environments/
-│   ├── demo/
-│   │   ├── main.tf                      ← Wires all modules together
-│   │   ├── variables.tf                 ← All configurable inputs
-│   │   ├── outputs.tf                   ← Key outputs + next steps
-│   │   ├── versions.tf                  ← Provider version constraints
-│   │   ├── backend.tf                   ← ⚠️ FILL IN: S3 bucket + DynamoDB table
-│   │   └── terraform.tfvars.example     ← ⚠️ COPY TO terraform.tfvars and fill in
-│   └── prod/
-│       ├── versions.tf
-│       ├── backend.tf                   ← ⚠️ FILL IN
-│       └── terraform.tfvars.example     ← ⚠️ COPY and fill in for production
-│
-├── scripts/
-│   ├── bootstrap-state.sh               ← Run ONCE: creates S3 + DynamoDB for tfstate
-│   ├── provision.sh                     ← Full stack creation (~25 min)
-│   ├── teardown.sh                      ← Full stack destruction
-│   ├── start-demo.sh                    ← Scale workers 0→2 (morning)
-│   ├── stop-demo.sh                     ← Scale workers 2→0 (evening)
-│   ├── gpu-on.sh                        ← Add GPU node for vLLM demos
-│   └── gpu-off.sh                       ← Remove GPU node
-│
-└── .github/workflows/
-    ├── tf-plan.yml                      ← PR: runs terraform plan, posts comment
-    └── tf-apply.yml                     ← Main push: runs terraform apply
+│   └── demo/
+│       ├── main.tf               # Module wiring
+│       ├── variables.tf          # All input variables
+│       ├── outputs.tf            # Cluster URLs, IDs, ARNs
+│       ├── backend.tf            # S3 remote state config
+│       ├── versions.tf           # Provider version constraints
+│       └── terraform.tfvars.example
+├── modules/
+│   ├── vpc/                      # VPC, subnets, NAT GW, route tables
+│   ├── rosa-hcp/                 # ROSA HCP cluster + machine pools
+│   ├── iam-irsa/                 # IAM roles for service accounts
+│   ├── aurora-serverless/        # Aurora Serverless v2 + pgvector
+│   ├── s3-data-lake/             # S3 bucket + lifecycle policies
+│   ├── efs-storage/              # EFS + access point
+│   ├── ecr-repos/                # ECR repositories
+│   └── lambda-triggers/          # Demo scheduler + budget alert
+└── scripts/
+    ├── bootstrap-state.sh        # Create S3 + DynamoDB for TF state
+    ├── post-apply.sh             # Operator roles, ingress, admin, pgvector
+    ├── teardown.sh               # Complete teardown
+    ├── redeploy.sh               # Full redeploy from scratch
+    └── init-pgvector.sh          # Initialise Aurora schema
 ```
 
 ---
 
-## 🔧 After terraform apply — Next Steps
+## Key Configuration
 
-The `terraform output next_steps` command (runs automatically at end of provision.sh) prints exactly what to do next. The summary is:
+`environments/demo/terraform.tfvars` — minimum required values:
 
-1. **Login to ROSA:** `oc login --server=$(terraform output -raw rosa_api_url) --username=cluster-admin`
-2. **Install RHOAI operator:** `rosa install-addon --cluster=rhoai-demo managed-odh`
-3. **Install EFS CSI driver:** `rosa install-addon --cluster=rhoai-demo aws-efs-csi-driver-operator`
-4. **Init pgvector in Aurora:** `psql <aurora_endpoint> -f modules/aurora-serverless/init.sql`
-5. **Bootstrap application layer** from your separate GitOps repository (ArgoCD, Helm charts)
-
----
-
-## 🚢 AWS Marketplace Packaging
-
-The CloudFormation templates for Marketplace distribution live in the `cloudformation/` directory (separate from this Terraform IaC). Key points:
-
-- **Terraform** = your own provisioning tool (developers, CI/CD pipeline)
-- **CloudFormation** = customer-facing delivery via AWS Marketplace
-- Use the `cfn-lint` pre-commit hook to validate templates before submission
-- Run `taskcat test run` to validate deployment across multiple AWS regions
-
-See the companion guide in `cloudformation/README.md`.
+```hcl
+owner_tag             = "skumar@iisl.com"
+budget_alert_email    = "skumar@iisl.com"
+rosa_cluster_name     = "rhoai-demo"
+ocp_version           = "4.17.50"          # 4.16 EOL — do not use
+aurora_engine_version = "16.4"
+oidc_config_id        = "2ovm1pcngkss9e6stmbirbefljiiuptk"
+account_role_prefix   = "rhoai-demo"
+```
 
 ---
 
-## 🤝 Contributing
+## ROSA Deployment Sequence
 
-1. Create a branch: `git checkout -b feat/your-change`
-2. Pre-commit hooks run automatically on `git commit` (terraform fmt, checkov, cfn-lint)
-3. Open a PR — GitHub Actions runs `terraform plan` and posts the output as a PR comment
-4. Merge to main — GitHub Actions runs `terraform apply` (with manual approval gate)
+Terraform alone is not sufficient for ROSA HCP. The correct sequence is:
+
+```
+1. terraform apply
+        ↓
+2. rosa create operator-roles --cluster rhoai-demo --hosted-cp --yes
+        ↓  (cluster moves from 'waiting' → 'installing' → 'ready')
+3. watch -n 30 'rosa describe cluster -c rhoai-demo | grep State'
+        ↓  (~15-20 min)
+4. rosa edit cluster -c rhoai-demo --private=false
+   rosa edit ingress -c rhoai-demo <ID> --private=false --yes
+        ↓  (3-5 min DNS propagation)
+5. rosa create admin -c rhoai-demo
+```
+
+`post-apply.sh` handles all 5 steps automatically.
+
+> ⚠️ **RHCS token expires in ~15 min.** The Terraform provider is configured with
+> `wait_for_create_complete = false` so apply returns immediately. Always re-export
+> the token before retrying: `rosa login && export RHCS_TOKEN=$(rosa token)`
 
 ---
 
-*Generated for RHOAI Demo Environment · AWS + ROSA Platform Architecture · 2025*
+## Public Ingress Fix
+
+ROSA HCP creates **private** ingress by default. Both flags must be set:
+
+```bash
+# Step 1 — cluster level
+rosa edit cluster -c rhoai-demo --private=false
+
+# Step 2 — ingress level (get the ID first)
+rosa list ingresses -c rhoai-demo
+rosa edit ingress -c rhoai-demo <INGRESS_ID> --private=false --yes
+
+# Step 3 — verify (wait 3-5 min)
+dig console-openshift-console.apps.rosa.rhoai-demo.pdde.p3.openshiftapps.com +short
+# Should return public IP (not 10.x.x.x)
+```
+
+---
+
+## RHOAI Installation
+
+`rosa install addon` is **not supported** on HCP clusters. Install via OperatorHub:
+
+```bash
+oc new-project redhat-ods-operator
+
+cat <<EOF | oc apply -f -
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: rhods-operator
+  namespace: redhat-ods-operator
+spec:
+  channel: stable
+  installPlanApproval: Automatic
+  name: rhods-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+EOF
+
+watch -n 15 'oc get csv -n redhat-ods-operator'
+```
+
+---
+
+## Teardown
+
+```bash
+./scripts/teardown.sh
+```
+
+Manual steps if script fails:
+
+```bash
+# 1. Delete cluster
+rosa delete cluster -c rhoai-demo --yes
+# Wait until: rosa list clusters  returns empty
+
+# 2. Clean ROSA roles
+rosa delete operator-roles -c rhoai-demo --yes
+rosa delete oidc-provider -c rhoai-demo --yes
+
+# 3. Remove stale TF state (single-quotes required in zsh for gpu[0])
+terraform state rm module.rosa.rhcs_hcp_machine_pool.workers
+terraform state rm 'module.rosa.rhcs_hcp_machine_pool.gpu[0]'
+terraform state rm module.rosa.rhcs_cluster_rosa_hcp.this
+
+# 4. Refresh tokens and destroy
+aws-login && rosa login && export RHCS_TOKEN=$(rosa token)
+terraform destroy -auto-approve
+
+# 5. If VPC deletion fails with DependencyViolation — delete leftover SGs
+aws ec2 describe-security-groups \
+  --filters "Name=vpc-id,Values=<VPC_ID>" \
+  --query "SecurityGroups[?GroupName!='default'].[GroupId,GroupName]" --output table
+aws ec2 delete-security-group --group-id <SG_ID>
+terraform destroy -auto-approve   # retry
+```
+
+> ⚠️ Account roles (`rhoai-demo-HCP-ROSA-*`) and OIDC config are preserved intentionally — reuse on redeploy.
+
+---
+
+## Daily Operations
+
+```bash
+# Morning — scale up
+rosa update machinepool -c rhoai-demo compute --min-replicas=2
+
+# Evening — scale down (min is 1 on HCP, not 0)
+rosa update machinepool -c rhoai-demo compute --min-replicas=1
+
+# Before GPU/vLLM demo
+rosa update machinepool -c rhoai-demo gpu-demo --min-replicas=1
+
+# After GPU demo
+rosa update machinepool -c rhoai-demo gpu-demo --min-replicas=0
+```
+
+### Overnight cost (workers scaled to min=1)
+
+| Resource | Cost/hr |
+|---|---|
+| ROSA HCP cluster fee | $0.25 |
+| 1× c5.2xlarge + ROSA fee | $0.68 |
+| 2× m5.xlarge HCP infra | $0.38 |
+| NAT GW + Aurora + EFS | ~$0.12 |
+| **Total** | **~$1.43/hr (~$14 overnight)** |
+
+---
+
+## Known Issues (all fixed in v3)
+
+| Error | Fix |
+|---|---|
+| `pip3 install` fails on Mac | `brew install pre-commit` |
+| `openshift-v` prefix in version | `version = var.ocp_version` (no prefix) |
+| OCP 4.16/4.15 not available | Use `4.17.50` |
+| Missing `rosa_creator_arn` → 400 | Added to `properties` block |
+| Cluster stuck in `waiting` | Run `rosa create operator-roles` after apply |
+| `--cluster` and `--prefix` conflict | Remove `--prefix` when `--cluster` is set |
+| `workers` pool name reserved | Renamed to `compute` |
+| Console/API unreachable | Set `--private=false` on BOTH cluster and ingress |
+| Ingress ID `default` invalid | Get real ID from `rosa list ingresses` |
+| DNS returns `10.x.x.x` after fix | Wait 3-5 min for NLB replacement |
+| `oc` GLIBC error on AL2 bastion | Use oc `4.13.0` (not latest) |
+| `rosa install addon` fails on HCP | Install RHOAI via `oc apply` Subscription |
+| SSM instance profile permission denied | Use SSH key pair (IAM blocked by SSO role) |
+| `zsh: no matches found: gpu[0]` | Single-quote: `'module.rosa...gpu[0]'` |
+| State checksum mismatch | Use **Calculated** checksum from error, not Stored |
+| VPC `DependencyViolation` on destroy | Delete leftover SGs (bastion-sg, ROSA vpce-sg) |
+
+---
+
+## Deployed Resources
+
+| Resource | Value |
+|---|---|
+| VPC | `vpc-0d581778f01402b9c` |
+| Private Subnets | `subnet-00e247c5583990d72`, `subnet-0d57e5d3282deefeb` |
+| Public Subnets | `subnet-0fd2fc4560352711a`, `subnet-01c86847fb1afd4ad` |
+| S3 Bucket | `rhoai-demo-demo-406337554361` |
+| Aurora | `rhoai-demo-demo-db.cluster-cidweltunfq6.us-east-1.rds.amazonaws.com` |
+| EFS | `fs-02b93265abb588d1c` |
+| TF State | `rhoai-demo-tfstate-406337554361` / `rhoai-demo-tflock` |
+| OIDC Config | `2ovm1pcngkss9e6stmbirbefljiiuptk` |
+| ROSA API | `https://api.rhoai-demo.pdde.p3.openshiftapps.com:443` |
+| ROSA Console | `https://console-openshift-console.apps.rosa.rhoai-demo.pdde.p3.openshiftapps.com` |
+
+---
+
+## Providers
+
+| Provider | Version |
+|---|---|
+| `hashicorp/aws` | `~> 5.50` |
+| `terraform-redhat/rhcs` | `~> 1.7` |
+
+> Full provisioning guide: `rhoai-provisioning-guide-v3.docx`
