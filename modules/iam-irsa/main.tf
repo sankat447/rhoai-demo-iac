@@ -12,14 +12,17 @@
 #   4. rhoai-ssm-access      — Pods read secrets from SSM Parameter Store
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── OIDC Provider lookup (created by ROSA) ───────────────────────────────────
-data "aws_iam_openid_connect_provider" "rosa" {
-  url = var.oidc_endpoint_url
+locals {
+  # FIX: strip then re-add https:// to guarantee correct format
+  # rosa module outputs URL without https://, but data source requires it
+  oidc_url      = replace(var.oidc_endpoint_url, "https://", "")
+  oidc_url_full = "https://${replace(var.oidc_endpoint_url, "https://", "")}"
+  oidc_arn      = data.aws_iam_openid_connect_provider.rosa.arn
 }
 
-locals {
-  oidc_url    = replace(var.oidc_endpoint_url, "https://", "")
-  oidc_arn    = data.aws_iam_openid_connect_provider.rosa.arn
+# ── OIDC Provider lookup (created by ROSA) ───────────────────────────────────
+data "aws_iam_openid_connect_provider" "rosa" {
+  url = local.oidc_url_full
 }
 
 # ── Helper: OIDC trust policy factory ────────────────────────────────────────

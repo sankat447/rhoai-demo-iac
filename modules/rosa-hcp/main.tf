@@ -1,76 +1,80 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # MODULE: rosa-hcp
-# Purpose : ROSA Hosted Control Plane cluster + machine pools
-# Provider: terraform-redhat/rhcs (Red Hat Cloud Services)
+# ROSA Hosted Control Plane cluster + worker + GPU machine pools
+# Provider: terraform-redhat/rhcs v1.7.x (schema verified from provider)
 #
-# PLATFORM SCOPE:
-#   - ROSA HCP cluster (control plane managed by Red Hat)
-#   - Worker machine pool (Spot for demo cost savings)
-#   - GPU machine pool (starts at 0 replicas — scale up for vLLM demos)
-#   - OIDC provider for IRSA (pod-level AWS credential federation)
-#
-# WHAT THIS DOES NOT COVER (application layer — GitOps repo):
-#   - RHOAI operator installation
-#   - ArgoCD bootstrap
-#   - Helm chart deployments
+# PREREQS - run ONCE before terraform apply:
+#   rosa login
+#   rosa create account-roles --hosted-cp --prefix rhoai-demo --yes
+#   rosa create oidc-config --managed --yes --region us-east-1
+#   rosa list oidc-config   <- copy ID to var.oidc_config_id
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── ROSA Account Roles (must exist before cluster) ───────────────────────────
-# These are account-wide IAM roles Red Hat needs to manage ROSA.
-# Create once per AWS account, reuse across clusters.
-resource "rhcs_rosa_hcp_account_roles" "this" {
-  account_role_prefix = var.cluster_name
-  path                = "/"
+data "aws_caller_identity" "current" {}
+
+locals {
+  account_id         = data.aws_caller_identity.current.account_id
+  installer_role_arn = "arn:aws:iam::${local.account_id}:role/${var.account_role_prefix}-HCP-ROSA-Installer-Role"
+  support_role_arn   = "arn:aws:iam::${local.account_id}:role/${var.account_role_prefix}-HCP-ROSA-Support-Role"
+  worker_role_arn    = "arn:aws:iam::${local.account_id}:role/${var.account_role_prefix}-HCP-ROSA-Worker-Role"
 }
 
-# ── ROSA HCP Cluster ─────────────────────────────────────────────────────────
 resource "rhcs_cluster_rosa_hcp" "this" {
-  name               = var.cluster_name
-  cloud_region       = var.aws_region
-  version            = "openshift-v${var.ocp_version}"
+  name         = var.cluster_name
+  cloud_region = var.aws_region
+  version      = var.ocp_version
 
-  aws_account_id         = data.aws_caller_identity.current.account_id
-  aws_billing_account_id = data.aws_caller_identity.current.account_id
+  aws_account_id         = local.account_id
+  aws_billing_account_id = local.account_id
 
-  # HCP model — control plane runs in Red Hat's account (no CP cost to you)
-  aws_subnet_ids = var.private_subnet_ids
+  aws_subnet_ids     = var.private_subnet_ids
+  availability_zones = var.availability_zones
 
-  # Network configuration
   machine_cidr = var.vpc_cidr
-  service_cidr = "172.30.0.0/16"   # OCP internal services
-  pod_cidr     = "10.128.0.0/14"   # OCP pod network
+  service_cidr = "172.30.0.0/16"
+  pod_cidr     = "10.128.0.0/14"
   host_prefix  = 23
 
-  # Admin user for initial oc login
+  private           = true
   create_admin_user = true
 
   properties = {
     rosa_creator_arn = data.aws_caller_identity.current.arn
   }
 
-  # Wait for account roles before creating cluster
-  depends_on = [rhcs_rosa_hcp_account_roles.this]
+  # STS block - exact schema verified from provider v1.7 schema output
+  sts = {
+    role_arn             = local.installer_role_arn
+    support_role_arn     = local.support_role_arn
+    oidc_config_id       = var.oidc_config_id
+    operator_role_prefix = var.account_role_prefix
+    instance_iam_roles = {
+      worker_role_arn = local.worker_role_arn
+    }
+  }
+
+  # Set to false — RHCS token expires before 20-min cluster creation completes
+  # Monitor progress with: rosa describe cluster -c rhoai-demo
+  wait_for_create_complete            = false
+  wait_for_std_compute_nodes_complete = false
 }
 
-# ── Worker Machine Pool — General Workloads ───────────────────────────────────
+# ── Worker Machine Pool ───────────────────────────────────────────────────────
 resource "rhcs_hcp_machine_pool" "workers" {
-  cluster      = rhcs_cluster_rosa_hcp.this.id
-  name         = "workers"
-  machine_type = var.worker_instance_type   # default: c5.2xlarge
-
-  # SPOT INSTANCES — saves 60-70% on EC2 vs on-demand
-  # Demo: use spot. Prod: use on-demand or mixed fleet.
-  aws_node_pool = {
-    instance_profile = ""   # auto-managed by ROSA
-  }
-
-  # Autoscaling: scale to 0 overnight to save cost
-  autoscaling = {
-    min_replicas = var.worker_min_replicas   # 0 for overnight, 2 for active
-    max_replicas = var.worker_max_replicas   # 4 for demo peak capacity
-  }
-
+  cluster   = rhcs_cluster_rosa_hcp.this.id
+  name      = "compute"
   subnet_id = var.private_subnet_ids[0]
+  auto_repair = true
+
+  aws_node_pool = {
+    instance_type = var.worker_instance_type
+  }
+
+  autoscaling = {
+    enabled      = true
+    min_replicas = var.worker_min_replicas
+    max_replicas = var.worker_max_replicas
+  }
 
   labels = {
     "node-role" = "worker"
@@ -78,37 +82,35 @@ resource "rhcs_hcp_machine_pool" "workers" {
   }
 }
 
-# ── GPU Machine Pool — vLLM / RHOAI Model Serving ────────────────────────────
+# ── GPU Machine Pool - starts at 0 replicas ───────────────────────────────────
 resource "rhcs_hcp_machine_pool" "gpu" {
   count = var.create_gpu_pool ? 1 : 0
 
-  cluster      = rhcs_cluster_rosa_hcp.this.id
-  name         = "gpu-demo"
-  machine_type = var.gpu_instance_type   # default: g4dn.xlarge (16GB T4)
+  cluster   = rhcs_cluster_rosa_hcp.this.id
+  name      = "gpu-demo"
+  subnet_id = var.private_subnet_ids[0]
+  auto_repair = true
 
-  # CRITICAL: Start at 0 replicas — only spin up for active GPU demos
-  # Run: rosa edit machinepool gpu-demo --cluster=NAME --replicas=1
-  autoscaling = {
-    min_replicas = 0
-    max_replicas = var.gpu_max_replicas   # default: 1 for demo
+  aws_node_pool = {
+    instance_type = var.gpu_instance_type
   }
 
-  subnet_id = var.private_subnet_ids[0]
+  # Start at 0 - scale up only for vLLM demos to save cost
+  autoscaling = {
+    enabled      = true
+    min_replicas = 0
+    max_replicas = var.gpu_max_replicas
+  }
 
   labels = {
-    "node-role"           = "worker"
-    "workload"            = "gpu"
-    "nvidia.com/gpu"      = "true"
+    "node-role"      = "worker"
+    "workload"       = "gpu"
+    "nvidia.com/gpu" = "true"
   }
 
-  taints = [
-    {
-      key    = "nvidia.com/gpu"
-      value  = "true"
-      effect = "NoSchedule"
-    }
-  ]
+  taints = [{
+    key           = "nvidia.com/gpu"
+    value         = "true"
+    schedule_type = "NoSchedule"
+  }]
 }
-
-# ── Data Sources ─────────────────────────────────────────────────────────────
-data "aws_caller_identity" "current" {}

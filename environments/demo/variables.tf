@@ -105,33 +105,138 @@ variable "gpu_max_replicas" {
 }
 
 # ── Aurora ───────────────────────────────────────────────────────────────────
-variable "db_name"                    { type = string; default = "rhoai_demo" }
-variable "db_master_username"         { type = string; default = "rhoai_admin" }
-variable "aurora_engine_version"      { type = string; default = "15.4" }
-variable "aurora_min_acu"             { type = number; default = 0.5;  description = "Min 0.5 ACU = ~$0.06/hr idle" }
-variable "aurora_max_acu"             { type = number; default = 4;    description = "Max ACU scales under load" }
-variable "aurora_skip_snapshot"       { type = bool;   default = true;  description = "DEMO: true. PROD: false!" }
-variable "aurora_deletion_protection" { type = bool;   default = false; description = "DEMO: false. PROD: true!" }
-variable "aurora_backup_retention"    { type = number; default = 1;    description = "DEMO: 1 day. PROD: 7+ days." }
+variable "db_name" {
+  description = "Initial database name"
+  type        = string
+  default     = "rhoai_demo"
+}
+
+variable "db_master_username" {
+  description = "Master DB username"
+  type        = string
+  default     = "rhoai_admin"
+}
+
+variable "aurora_engine_version" {
+  description = "Aurora PostgreSQL engine version"
+  type        = string
+  default     = "15.4"
+}
+
+variable "aurora_min_acu" {
+  description = "Min ACU (0.5 = cheapest idle cost ~$0.06/hr)"
+  type        = number
+  default     = 0.5
+}
+
+variable "aurora_max_acu" {
+  description = "Max ACU scales under load"
+  type        = number
+  default     = 4
+}
+
+variable "aurora_skip_snapshot" {
+  description = "DEMO: true. PROD: false!"
+  type        = bool
+  default     = true
+}
+
+variable "aurora_deletion_protection" {
+  description = "DEMO: false. PROD: true!"
+  type        = bool
+  default     = false
+}
+
+variable "aurora_backup_retention" {
+  description = "DEMO: 1 day. PROD: 7+ days."
+  type        = number
+  default     = 1
+}
 
 # ── S3 ───────────────────────────────────────────────────────────────────────
-variable "create_tfstate_bucket"        { type = bool;   default = false; description = "Set true only on first run to bootstrap state backend" }
-variable "pipeline_log_retention_days"  { type = number; default = 30 }
+variable "create_tfstate_bucket" {
+  description = "Set true only on first run to bootstrap state backend"
+  type        = bool
+  default     = false
+}
+
+variable "pipeline_log_retention_days" {
+  type    = number
+  default = 30
+}
 
 # ── ECR ──────────────────────────────────────────────────────────────────────
 variable "ecr_repository_names" {
   type    = list(string)
-  default = ["rhoai-demo/notebook-base", "rhoai-demo/langchain-server", "rhoai-demo/lambda-metering"]
+  default = [
+    "rhoai-demo/notebook-base",
+    "rhoai-demo/langchain-server",
+    "rhoai-demo/lambda-metering"
+  ]
 }
-variable "ecr_image_tag_mutability"    { type = string; default = "MUTABLE" }
-variable "ecr_scan_on_push"            { type = bool;   default = true }
-variable "ecr_enable_quay_pullthrough" { type = bool;   default = false }
+
+variable "ecr_image_tag_mutability" {
+  type    = string
+  default = "MUTABLE"
+}
+
+variable "ecr_scan_on_push" {
+  type    = bool
+  default = true
+}
+
+variable "ecr_enable_quay_pullthrough" {
+  type    = bool
+  default = false
+}
 
 # ── Bedrock ──────────────────────────────────────────────────────────────────
-variable "enable_bedrock_access" { type = bool; default = true }
+variable "enable_bedrock_access" {
+  type    = bool
+  default = true
+}
 
 # ── Lambda + Automation ──────────────────────────────────────────────────────
-variable "budget_alert_email"  { type = string; default = ""; description = "Email for budget alerts" }
-variable "monthly_budget_usd"  { type = number; default = 700 }
-variable "demo_start_cron"     { type = string; default = "cron(0 8 ? * MON-FRI *)";  description = "UTC time to scale workers UP (8am UTC = adjust for your TZ)" }
-variable "demo_stop_cron"      { type = string; default = "cron(0 20 ? * MON-FRI *)"; description = "UTC time to scale workers DOWN" }
+variable "budget_alert_email" {
+  description = "Email for budget alerts"
+  type        = string
+  default     = ""
+}
+
+variable "monthly_budget_usd" {
+  type    = number
+  default = 700
+}
+
+variable "demo_start_cron" {
+  description = "UTC time to scale workers UP (8am UTC = adjust for your TZ)"
+  type        = string
+  default     = "cron(0 8 ? * MON-FRI *)"
+}
+
+variable "demo_stop_cron" {
+  description = "UTC time to scale workers DOWN"
+  type        = string
+  default     = "cron(0 20 ? * MON-FRI *)"
+}
+
+variable "oidc_config_id" {
+  description = <<-DESC
+    OIDC config ID for ROSA HCP. Create BEFORE terraform apply:
+      rosa create oidc-config --managed --yes --region us-east-1
+      rosa list oidc-config
+    Copy the ID column value here.
+  DESC
+  type        = string
+  default     = ""
+}
+
+variable "account_role_prefix" {
+  description = <<-DESC
+    Account role prefix for ROSA HCP. Create BEFORE terraform apply:
+      rosa create account-roles --hosted-cp --prefix rhoai-demo --yes
+    Use the same prefix here.
+  DESC
+  type        = string
+  default     = "rhoai-demo"
+}

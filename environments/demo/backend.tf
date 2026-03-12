@@ -11,10 +11,10 @@
 terraform {
   backend "s3" {
     # ── FILL IN YOUR VALUES ──────────────────────────────────────────────────
-    bucket         = "REPLACE_WITH_TFSTATE_BUCKET_NAME"    # e.g. rhoai-demo-tfstate-123456789012
+    bucket         = "rhoai-demo-tfstate-406337554361"    # e.g. rhoai-demo-tfstate-123456789012
     key            = "demo/terraform.tfstate"
     region         = "us-east-1"                           # Must match var.aws_region
-    dynamodb_table = "REPLACE_WITH_DYNAMODB_TABLE_NAME"    # e.g. rhoai-demo-tflock
+    dynamodb_table = "rhoai-demo-tflock"    # e.g. rhoai-demo-tflock
     encrypt        = true
     # ─────────────────────────────────────────────────────────────────────────
   }

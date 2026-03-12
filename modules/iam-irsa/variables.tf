@@ -1,10 +1,43 @@
-variable "cluster_name"         { type = string; description = "ROSA cluster name prefix for role names" }
-variable "aws_region"           { type = string; description = "AWS region" }
-variable "oidc_endpoint_url"    { type = string; description = "OIDC endpoint URL from rosa-hcp module output" }
-variable "s3_bucket_name"       { type = string; description = "S3 bucket name from s3-data-lake module output" }
-variable "enable_bedrock_access" { type = bool; default = true; description = "Create Bedrock invoke role" }
-variable "ssm_path_prefix"      { type = string; default = "rhoai-demo"; description = "SSM parameter path prefix" }
-variable "tags"                 { type = map(string); default = {} }
+# ─────────────────────────────────────────────────────────────────────────────
+# MODULE: iam-irsa — Input Variables
+# ─────────────────────────────────────────────────────────────────────────────
+
+variable "cluster_name" {
+  description = "ROSA cluster name prefix for role names"
+  type        = string
+}
+
+variable "aws_region" {
+  description = "AWS region"
+  type        = string
+}
+
+variable "oidc_endpoint_url" {
+  description = "OIDC endpoint URL from rosa-hcp module output"
+  type        = string
+}
+
+variable "s3_bucket_name" {
+  description = "S3 bucket name from s3-data-lake module output"
+  type        = string
+}
+
+variable "enable_bedrock_access" {
+  description = "Create Bedrock invoke role"
+  type        = bool
+  default     = true
+}
+
+variable "ssm_path_prefix" {
+  description = "SSM parameter path prefix"
+  type        = string
+  default     = "rhoai-demo"
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
 
 variable "service_account_roles" {
   description = "Map of SA bindings. Key = role name, value = {namespace, service_account}."

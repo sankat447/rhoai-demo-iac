@@ -1,38 +1,29 @@
-# ─────────────────────────────────────────────────────────────────────────────
-# MODULE: rosa-hcp — Outputs
-# ─────────────────────────────────────────────────────────────────────────────
-
 output "cluster_id" {
-  description = "ROSA cluster ID — used by iam-irsa module"
   value       = rhcs_cluster_rosa_hcp.this.id
+  description = "ROSA cluster ID"
 }
 
 output "cluster_name" {
-  description = "ROSA cluster name"
   value       = rhcs_cluster_rosa_hcp.this.name
+  description = "ROSA cluster name"
 }
 
 output "api_url" {
-  description = "OCP API server URL — use for: oc login --server=API_URL"
   value       = rhcs_cluster_rosa_hcp.this.api_url
+  description = "OCP API URL — use for: oc login --server=THIS"
 }
 
 output "console_url" {
-  description = "OpenShift web console URL"
   value       = rhcs_cluster_rosa_hcp.this.console_url
+  description = "OpenShift web console URL"
 }
 
 output "oidc_endpoint_url" {
-  description = "OIDC endpoint URL — pass to iam-irsa module for IRSA setup"
   value       = rhcs_cluster_rosa_hcp.this.sts.oidc_endpoint_url
-}
-
-output "oidc_config_id" {
-  description = "OIDC configuration ID"
-  value       = rhcs_cluster_rosa_hcp.this.sts.oidc_config_id
+  description = "OIDC endpoint — pass to iam-irsa module"
 }
 
 output "cluster_state" {
-  description = "Current cluster state (ready/installing/etc.)"
   value       = rhcs_cluster_rosa_hcp.this.state
+  description = "Current cluster state"
 }
