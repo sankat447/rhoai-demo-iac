@@ -4,3 +4,15 @@
 crash.log
 crash.*.log
 .terraform.lock.hcl
+
+# ── Terraform plan files ──────────────────────────────────────────────────────
+tfplan
+*.tfplan
+
+# ── Deployment logs ───────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Terraform state backup files ─────────────────────────────────────────────
+*.tfstate.backup
+*.terraform.lock.hcl.backup
