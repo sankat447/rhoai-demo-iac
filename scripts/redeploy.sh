@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
 # redeploy.sh
-# Full redeploy from scratch — run after teardown.sh
+# Full redeploy from scratch — run after AI-demo-stack-destroy.sh
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 

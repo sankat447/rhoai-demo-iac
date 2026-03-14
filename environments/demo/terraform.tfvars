@@ -12,7 +12,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Project Identity — FILL THESE IN ────────────────────────────────────────
-project_name = "rhoai-demo"
+project_name = "rhoai"
 environment  = "demo"
 owner_tag    = "skumar@iisl.com"           # e.g. "john.smith@company.com"
 aws_region   = "us-east-1"                    # cheapest for ROSA
@@ -57,6 +57,7 @@ ecr_repository_names = [
   "rhoai-demo/langchain-server",
   "rhoai-demo/lambda-metering"
 ]
+# Note: ECR repo names kept as "rhoai-demo" for consistency with existing images
 ecr_image_tag_mutability    = "MUTABLE"       # IMMUTABLE for production
 ecr_scan_on_push            = true
 ecr_enable_quay_pullthrough = false
