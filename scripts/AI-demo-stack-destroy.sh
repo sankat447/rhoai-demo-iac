@@ -38,6 +38,40 @@ log_ok() { echo -e "${GREEN}✔${RESET} $*" | tee -a "${LOG_FILE}"; }
 log_warn() { echo -e "${YELLOW}⚠${RESET} $*" | tee -a "${LOG_FILE}"; }
 log_error() { echo -e "${RED}✘${RESET} $*" | tee -a "${LOG_FILE}"; }
 
+# ── Token helper: persist RHCS_TOKEN to shell rc for the Terraform rhcs provider
+# NOTE: This is only needed for the rhcs Terraform provider, NOT for rosa CLI login.
+# rosa CLI now uses Red Hat SSO (browser-based). The rhcs provider still requires
+# a token obtained via: rosa token  (after SSO login)
+persist_and_export_token() {
+  local TOKEN="$1"
+  local SHELL_RC
+  if [[ -n "${ZSH_VERSION:-}" || "${SHELL:-}" == */zsh ]]; then
+    SHELL_RC="$HOME/.zshrc"
+  elif [[ -n "${BASH_VERSION:-}" || "${SHELL:-}" == */bash ]]; then
+    SHELL_RC="$HOME/.bash_profile"
+  else
+    SHELL_RC="$HOME/.profile"
+  fi
+
+  export RHCS_TOKEN="$TOKEN"
+  export ROSA_TOKEN="$TOKEN"
+  log_ok "RHCS_TOKEN exported for Terraform rhcs provider"
+
+  if [[ -f "$SHELL_RC" ]]; then
+    local TMP
+    TMP=$(mktemp)
+    grep -v "^export RHCS_TOKEN=" "$SHELL_RC" | grep -v "^export ROSA_TOKEN=" > "$TMP"
+    mv "$TMP" "$SHELL_RC"
+  fi
+  {
+    echo ""
+    echo "# RHCS token for Terraform provider (updated $(date '+%Y-%m-%d %H:%M'))"
+    echo "export RHCS_TOKEN=\"${TOKEN}\""
+    echo "export ROSA_TOKEN=\"${TOKEN}\""
+  } >> "$SHELL_RC"
+  log_ok "RHCS_TOKEN persisted to ${SHELL_RC}"
+}
+
 echo ""
 echo -e "${RED}${BOLD}╔══════════════════════════════════════════════════════════════════════╗${RESET}"
 echo -e "${RED}${BOLD}║                    COMPLETE TEARDOWN WARNING                        ║${RESET}"
@@ -84,32 +118,47 @@ log "Log file: ${LOG_FILE}"
 log_section "STEP 1: ROSA AUTHENTICATION"
 # ─────────────────────────────────────────────────────────────────────────────
 
-log_ok "Checking ROSA authentication..."
-if rosa whoami &>/dev/null; then
-    OCM_EMAIL=$(rosa whoami 2>&1 | grep "OCM Account Email" | awk '{print $NF}')
-    log_ok "ROSA authenticated - $OCM_EMAIL"
+# ── rosa CLI login (Red Hat SSO — browser-based) ──────────────────────────────
+# Offline token login is deprecated by Red Hat. rosa login now uses SSO.
+log_ok "Checking OCM authentication (rosa whoami)..."
+WHOAMI_OUT=$(rosa whoami 2>&1)
+if echo "$WHOAMI_OUT" | grep -q "OCM Account Email"; then
+    OCM_EMAIL=$(echo "$WHOAMI_OUT" | grep "OCM Account Email" | awk '{print $NF}')
+    log_ok "OCM authenticated — $OCM_EMAIL"
 else
-    log_warn "ROSA not authenticated"
-    log "Red Hat has deprecated token-based login"
-    log "Using Red Hat SSO credentials to login"
+    log_warn "ROSA not authenticated — launching Red Hat SSO login..."
+    echo -e "     A browser window will open for Red Hat SSO. Complete login then return here."
     echo ""
-    
-    log_ok "Logging in with Red Hat SSO..."
     if rosa login --use-auth-code; then
-        OCM_EMAIL=$(rosa whoami 2>&1 | grep "OCM Account Email" | awk '{print $NF}')
-        log_ok "ROSA authenticated - $OCM_EMAIL"
-        
-        # Export token for Terraform rhcs provider
-        RHCS_TOKEN=$(rosa token 2>/dev/null || echo "")
-        if [ -n "$RHCS_TOKEN" ]; then
-            export RHCS_TOKEN
-            export ROSA_TOKEN="$RHCS_TOKEN"
-            log_ok "Token exported for Terraform provider"
+        WHOAMI_OUT=$(rosa whoami 2>&1)
+        if echo "$WHOAMI_OUT" | grep -q "OCM Account Email"; then
+            OCM_EMAIL=$(echo "$WHOAMI_OUT" | grep "OCM Account Email" | awk '{print $NF}')
+            log_ok "OCM authenticated — $OCM_EMAIL"
+        else
+            log_error "ROSA login failed — check your Red Hat account at https://console.redhat.com"
+            exit 1
         fi
     else
         log_error "ROSA login failed"
         exit 1
     fi
+fi
+
+# ── RHCS_TOKEN for Terraform rhcs provider ────────────────────────────────────
+# The rhcs Terraform provider still requires a token. Obtain it from the active
+# rosa CLI session (no manual copy/paste needed after SSO login).
+if [[ -z "${RHCS_TOKEN:-}" ]]; then
+    log "Obtaining RHCS_TOKEN from active rosa session for Terraform provider..."
+    RHCS_TOKEN_FROM_ROSA=$(rosa token 2>/dev/null || echo "")
+    if [[ -n "$RHCS_TOKEN_FROM_ROSA" ]]; then
+        persist_and_export_token "$RHCS_TOKEN_FROM_ROSA"
+    else
+        log_error "Could not obtain RHCS_TOKEN — Terraform destroy will fail"
+        log_error "Try: ./scripts/reauth.sh then retry destroy"
+        exit 1
+    fi
+else
+    log_ok "RHCS_TOKEN already set in environment — Terraform rhcs provider ready"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -178,14 +227,79 @@ log_section "STEP 4: TERRAFORM DESTROY (ROSA + IAM IRSA)"
 
 cd "${ENV_DIR}" || { log_error "Cannot navigate to ${ENV_DIR}"; exit 1; }
 
-log "Running terraform destroy for ROSA and IAM IRSA modules..."
-terraform destroy \
-    -target=module.rosa \
-    -target=module.iam_irsa \
-    -auto-approve \
-    2>&1 | tee -a "${LOG_FILE}"
+# Refresh token before terraform destroy — Steps 2-3 may have taken several minutes
+log "Refreshing ROSA token before Terraform destroy..."
+NEW_TOKEN=$(rosa token 2>/dev/null || echo "")
+if [[ -n "$NEW_TOKEN" ]]; then
+    persist_and_export_token "$NEW_TOKEN"
+else
+    log_warn "Could not refresh token — proceeding with existing token"
+fi
 
-if [ ${PIPESTATUS[0]} -eq 0 ]; then
+# ── Destroy with token-expiry retry (mirrors run_apply_with_retry in create script)
+run_destroy_with_retry() {
+    local DESTROY_TARGETS="$1"
+    local DESTROY_LOG="${LOG_DIR}/destroy_${TIMESTAMP}.log"
+    local attempt=1
+    local max_attempts=3
+
+    while (( attempt <= max_attempts )); do
+        log "terraform destroy — attempt ${attempt} of ${max_attempts}"
+
+        eval terraform destroy $DESTROY_TARGETS -auto-approve 2>&1 | tee "$DESTROY_LOG"
+        local RC=${PIPESTATUS[0]}
+
+        # ── Token expiry mid-destroy ─────────────────────────────────────────
+        if grep -qiE "invalid_grant|invalid refresh token|can.t get access token|token.*expired" "$DESTROY_LOG" 2>/dev/null; then
+            echo ""
+            log_warn "ROSA/OCM token expired mid-destroy — re-authenticating via SSO..."
+            echo -e "     A browser window will open for Red Hat SSO. Complete login then return here."
+
+            rosa login --use-auth-code || { log_error "ROSA re-login failed"; return 1; }
+
+            if rosa whoami 2>&1 | grep -q "OCM Account Email"; then
+                NEW_TOKEN=$(rosa token 2>/dev/null || echo "")
+                [[ -n "$NEW_TOKEN" ]] && persist_and_export_token "$NEW_TOKEN"
+                log_ok "ROSA re-authenticated — retrying destroy..."
+                attempt=$(( attempt + 1 ))
+                continue
+            else
+                log_error "ROSA re-authentication failed"
+                return 1
+            fi
+        fi
+
+        # ── Cluster already deleted outside Terraform ────────────────────────
+        if grep -qiE "can.t find cluster|cluster.*not found" "$DESTROY_LOG" 2>/dev/null; then
+            log_warn "Cluster appears already deleted outside Terraform — removing from state"
+            terraform state rm module.rosa.rhcs_cluster_rosa_hcp.this 2>&1 | tee -a "${LOG_FILE}" || true
+            terraform state rm module.rosa.rhcs_hcp_machine_pool.workers 2>&1 | tee -a "${LOG_FILE}" || true
+            terraform state rm 'module.rosa.rhcs_hcp_machine_pool.gpu[0]' 2>&1 | tee -a "${LOG_FILE}" || true
+            log_ok "Stale ROSA resources removed from state"
+
+            # Retry destroy for remaining resources (IAM IRSA)
+            log "Retrying destroy for remaining resources..."
+            terraform destroy -target=module.iam_irsa -auto-approve 2>&1 | tee -a "${LOG_FILE}" || log_warn "IAM IRSA destroy had errors"
+            return 0
+        fi
+
+        # ── Success ──────────────────────────────────────────────────────────
+        if [[ $RC -eq 0 ]]; then
+            return 0
+        fi
+
+        # ── Non-token error ──────────────────────────────────────────────────
+        log_error "terraform destroy failed (exit ${RC}) — see: ${DESTROY_LOG}"
+        grep -A5 "│ Error:" "$DESTROY_LOG" 2>/dev/null | head -40
+        return 1
+    done
+
+    log_error "terraform destroy failed after ${max_attempts} attempts"
+    return 1
+}
+
+log "Running terraform destroy for ROSA and IAM IRSA modules..."
+if run_destroy_with_retry "-target=module.rosa -target=module.iam_irsa"; then
     log_ok "ROSA cluster and IAM IRSA roles destroyed"
 else
     log_error "ROSA destroy had errors - check log file"
@@ -228,22 +342,28 @@ if [ -n "$S3_BUCKET" ]; then
     fi
 fi
 
+# Refresh token before full destroy — ROSA teardown (Steps 4-6) may have taken 15+ minutes
+log "Refreshing ROSA token before full Terraform destroy..."
+NEW_TOKEN=$(rosa token 2>/dev/null || echo "")
+if [[ -n "$NEW_TOKEN" ]]; then
+    persist_and_export_token "$NEW_TOKEN"
+else
+    log_warn "Could not refresh token — proceeding with existing token"
+fi
+
 log "Running full terraform destroy (handles all dependencies)..."
 log "This may take 10-15 minutes..."
 
-# Full destroy without -target flags (handles dependencies properly)
-terraform destroy -auto-approve 2>&1 | tee -a "${LOG_FILE}"
-DESTROY_RC=${PIPESTATUS[0]}
-
-if [ $DESTROY_RC -eq 0 ]; then
+# Full destroy using retry wrapper (handles token expiry mid-destroy)
+if run_destroy_with_retry ""; then
     log_ok "All AWS resources destroyed successfully"
 else
     log_warn "Terraform destroy completed with warnings - checking state..."
-    
+
     # Refresh state to sync with actual AWS resources
     log "Refreshing Terraform state..."
     terraform refresh 2>&1 | tee -a "${LOG_FILE}" || log_warn "State refresh had issues"
-    
+
     # Retry destroy if there are remaining resources
     REMAINING=$(terraform plan -json 2>/dev/null | grep -c '"type": "resource"' || echo "0")
     if [ "$REMAINING" -gt 0 ]; then
