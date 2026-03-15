@@ -7,7 +7,7 @@
 #  Covers  : AWS Platform Layer + ROSA HCP Cluster + IAM IRSA
 #  Duration: ~30-35 minutes
 # =============================================================================
-set -euo pipefail
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="${SCRIPT_DIR}/.."
@@ -129,7 +129,7 @@ persist_and_export_token() {
 }
 
 # ── Banner ────────────────────────────────────────────────────────────────────
-clear
+clear 2>/dev/null || true
 echo ""
 echo -e "${BLUE}${BOLD}╔══════════════════════════════════════════════════════════════════════╗${RESET}"
 echo -e "${BLUE}${BOLD}║                                                                      ║${RESET}"
@@ -161,7 +161,11 @@ section "PHASE 0.1 — REQUIRED TOOLS CHECK"
 ABORT_MISSING=false
 for tool in aws terraform rosa oc git jq; do
   if command -v "$tool" &>/dev/null; then
-    VER=$("$tool" --version 2>&1 | head -1)
+    if [[ "$tool" == "rosa" || "$tool" == "oc" ]]; then
+      VER=$(timeout 5 "$tool" version 2>&1 | head -1 || echo "(version check timeout)")
+    else
+      VER=$(timeout 5 "$tool" --version 2>&1 | head -1 || echo "(version check timeout)")
+    fi
     log_ok "$tool  →  $VER"
   else
     log_fail "$tool not found"
@@ -203,7 +207,7 @@ else
   log_warn "ROSA not authenticated — launching Red Hat SSO login..."
   echo -e "     ${DIM}A browser window will open for Red Hat SSO. Complete login then return here.${RESET}"
   echo ""
-  rosa login || abort "ROSA login failed — ensure you have a Red Hat account at https://console.redhat.com"
+  rosa login --use-auth-code || abort "ROSA login failed — ensure you have a Red Hat account at https://console.redhat.com"
 
   WHOAMI_OUT=$(rosa whoami 2>&1)
   if echo "$WHOAMI_OUT" | grep -q "OCM Account Email"; then
@@ -290,10 +294,10 @@ log_info "Running: terraform plan -out=tfplan"
 echo -e "     ${DIM}Log: ${PLAN_LOG}${RESET}"
 echo ""
 
-terraform plan -out=tfplan 2>&1 | tee "$PLAN_LOG"
+terraform plan -out=tfplan 2>&1 | tee "$PLAN_LOG" || true
 TF_PLAN_RC=${PIPESTATUS[0]}
 
-echo ""
+echo "" || true
 if [[ $TF_PLAN_RC -eq 0 ]]; then
   PLAN_SUMMARY=$(grep -E "^Plan:|^No changes\." "$PLAN_LOG" | tail -1)
   log_ok "terraform plan succeeded"
@@ -316,16 +320,18 @@ section "PHASE 1.3 — TERRAFORM APPLY  (AWS + ROSA)"
 echo ""
 echo -e "${YELLOW}${BOLD}  ⚠  This will create real AWS resources and incur costs.${RESET}"
 echo -e "${YELLOW}     Estimated: ~\$2/hr (~\$50/day) with cluster running${RESET}"
-
-if ! confirm "Run terraform apply now?"; then
-  log_warn "Apply skipped by user."
-  echo -e "${WHITE}  To apply later:${RESET}"
-  echo -e "${DIM}    cd ${ENV_DIR}${RESET}"
-  echo -e "${DIM}    export RHCS_TOKEN=<token>${RESET}"
-  echo -e "${DIM}    terraform apply tfplan${RESET}"
-  print_summary
-  exit 0
+echo ""
+log_info "Refreshing ROSA token before apply to prevent mid-apply expiry..."
+NEW_TOKEN=$(rosa token 2>/dev/null || echo "")
+if [[ -n "$NEW_TOKEN" ]]; then
+  persist_and_export_token "$NEW_TOKEN"
+  log_ok "Token refreshed successfully"
+else
+  log_warn "Could not refresh token — proceeding anyway"
 fi
+echo ""
+log_info "Auto-proceeding with terraform apply..."
+echo ""
 
 # ── Apply with token-expiry retry ─────────────────────────────────────────────
 run_apply_with_retry() {
@@ -351,7 +357,7 @@ run_apply_with_retry() {
       log_warn "ROSA/OCM token expired mid-apply — re-authenticating via SSO..."
       echo -e "     ${DIM}A browser window will open for Red Hat SSO. Complete login then return here.${RESET}"
 
-      rosa login || { log_fail "ROSA re-login failed — aborting apply"; return 1; }
+      rosa login --use-auth-code || { log_fail "ROSA re-login failed — aborting apply"; return 1; }
 
       if rosa whoami 2>&1 | grep -q "OCM Account Email"; then
         # Refresh RHCS_TOKEN from the new SSO session for the rhcs provider
@@ -441,7 +447,7 @@ while (( WAIT_MINUTES < MAX_WAIT )); do
       log_warn "Could not retrieve cluster state — checking ROSA auth..."
       if ! rosa whoami &>/dev/null; then
         log_warn "ROSA session expired — re-authenticating via SSO..."
-        rosa login 2>/dev/null || true
+        rosa login --use-auth-code 2>/dev/null || true
         NEW_TOKEN=$(rosa token 2>/dev/null || echo "")
         [[ -n "$NEW_TOKEN" ]] && persist_and_export_token "$NEW_TOKEN"
       fi
@@ -456,6 +462,29 @@ if [[ "$CLUSTER_STATE" != "ready" && $WAIT_MINUTES -ge $MAX_WAIT ]]; then
   log_warn "Cluster not ready after ${MAX_WAIT} minutes — check manually:"
   echo -e "     ${WHITE}rosa describe cluster -c ${CLUSTER_NAME}${RESET}"
 fi
+
+# =============================================================================
+section "PHASE 2.5 — REFRESH OUTPUTS (ROSA API & CONSOLE URLs)"
+# =============================================================================
+
+log_info "Refreshing Terraform state to populate ROSA outputs..."
+echo ""
+
+# Refresh token one more time to ensure state refresh succeeds
+NEW_TOKEN=$(rosa token 2>/dev/null || echo "")
+if [[ -n "$NEW_TOKEN" ]]; then
+  persist_and_export_token "$NEW_TOKEN"
+fi
+
+# Run terraform apply to sync newly uncommented outputs
+if terraform apply -auto-approve 2>&1 | tee -a "${LOG_FILE}"; then
+  log_ok "Terraform state refreshed — outputs populated"
+else
+  log_warn "Terraform apply for output refresh had issues — attempting manual refresh"
+  terraform refresh 2>&1 | tee -a "${LOG_FILE}" || true
+fi
+
+echo ""
 
 # =============================================================================
 section "PHASE 3 — POST-DEPLOY SUMMARY"
@@ -473,23 +502,73 @@ AURORA_EP=$(terraform output -raw aurora_endpoint 2>/dev/null || echo "")
 [[ -n "$API_URL"    ]] && log_ok "API URL    : ${API_URL}"
 [[ -n "$CONSOLE_URL" ]] && log_ok "Console    : ${CONSOLE_URL}"
 
+# =============================================================================
+section "PHASE 4 — CLUSTER ADMIN SETUP"
+# =============================================================================
+
+log_info "Cleaning up old cluster admin..."
+if rosa delete admin -c "$CLUSTER_NAME" --yes 2>/dev/null; then
+  log_ok "Old cluster admin deleted"
+else
+  log_warn "No existing cluster admin found (or already deleted)"
+fi
+
+echo ""
+log_info "Creating new cluster admin..."
+echo -e "     ${DIM}This may take 1-2 minutes for OAuth to propagate${RESET}"
+echo ""
+
+ADMIN_OUTPUT=$(rosa create admin -c "$CLUSTER_NAME" 2>&1)
+ADMIN_RC=$?
+
+if [[ $ADMIN_RC -eq 0 ]]; then
+  ADMIN_USER=$(echo "$ADMIN_OUTPUT" | grep -oP "username: \K[^ ]+" | head -1)
+  ADMIN_PASS=$(echo "$ADMIN_OUTPUT" | grep -oP "password: \K[^ ]+" | head -1)
+  
+  if [[ -n "$ADMIN_USER" && -n "$ADMIN_PASS" ]]; then
+    log_ok "Cluster admin created successfully"
+  else
+    log_warn "Could not parse admin credentials from output"
+    echo "$ADMIN_OUTPUT"
+  fi
+else
+  log_warn "Failed to create cluster admin — you can create it manually later"
+  echo "$ADMIN_OUTPUT"
+fi
+
 echo ""
 echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════════════════════════╗${RESET}"
 echo -e "${GREEN}${BOLD}║                    PROVISIONING COMPLETE  🎉                         ║${RESET}"
 echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════════════════════════════════╝${RESET}"
 echo ""
+echo -e "${WHITE}${BOLD}OpenShift Console Access:${RESET}"
+echo ""
+if [[ -n "$CONSOLE_URL" ]]; then
+  echo -e "${CYAN}Console URL:${RESET}"
+  echo -e "  ${WHITE}${BOLD}${CONSOLE_URL}${RESET}"
+  echo ""
+fi
+if [[ -n "$ADMIN_USER" && -n "$ADMIN_PASS" ]]; then
+  echo -e "${CYAN}Credentials:${RESET}"
+  echo -e "  ${WHITE}${BOLD}Username: ${ADMIN_USER}${RESET}"
+  echo -e "  ${WHITE}${BOLD}Password: ${ADMIN_PASS}${RESET}"
+  echo ""
+  echo -e "${YELLOW}${BOLD}⚠  Save these credentials — they will not be shown again${RESET}"
+  echo ""
+fi
 echo -e "${WHITE}${BOLD}Next Steps:${RESET}"
 echo ""
-echo -e "${CYAN}1. Create cluster admin:${RESET}"
-echo -e "   ${DIM}rosa create admin -c ${CLUSTER_NAME}${RESET}"
+echo -e "${CYAN}1. Wait 2-3 minutes for OAuth to propagate, then login:${RESET}"
+if [[ -n "$API_URL" ]]; then
+  echo -e "   ${DIM}oc login ${API_URL} --username ${ADMIN_USER:-cluster-admin}${RESET}"
+else
+  echo -e "   ${DIM}oc login <API_URL> --username ${ADMIN_USER:-cluster-admin}${RESET}"
+fi
 echo ""
-echo -e "${CYAN}2. Login to cluster (wait 2-3 min for OAuth):${RESET}"
-echo -e "   ${DIM}oc login ${API_URL} --username cluster-admin${RESET}"
-echo ""
-echo -e "${CYAN}3. Verify:${RESET}"
+echo -e "${CYAN}2. Verify cluster:${RESET}"
 echo -e "   ${DIM}oc get nodes && oc get co${RESET}"
 echo ""
-echo -e "${CYAN}4. Cost controls:${RESET}"
+echo -e "${CYAN}3. Cost controls:${RESET}"
 echo -e "   ${DIM}Stop:     ./scripts/stop-demo.sh   (~\$0.73/hr)${RESET}"
 echo -e "   ${DIM}Destroy:  ./scripts/AI-demo-stack-destroy.sh   (\$0/hr)${RESET}"
 echo ""

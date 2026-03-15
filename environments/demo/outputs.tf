@@ -94,15 +94,46 @@ output "scheduler_lambda_arn" {
   description = "Demo scheduler Lambda ARN"
 }
 
-# ── ROSA + IAM — COMMENTED until IAM permissions are granted ─────────────────
-# output "rosa_cluster_id"     { value = module.rosa.cluster_id }
-# output "rosa_api_url"        { value = module.rosa.api_url }
-# output "rosa_console_url"    { value = module.rosa.console_url }
-# output "oidc_endpoint_url"   { value = module.rosa.oidc_endpoint_url }
-# output "bedrock_role_arn"    { value = module.iam_irsa.bedrock_role_arn }
-# output "s3_role_arn"         { value = module.iam_irsa.s3_role_arn }
-# output "ecr_role_arn"        { value = module.iam_irsa.ecr_role_arn }
-# output "ssm_role_arn"        { value = module.iam_irsa.ssm_role_arn }
+# ── ROSA + IAM ──────────────────────────────────────────────────────────────
+output "rosa_cluster_id" {
+  value       = module.rosa.cluster_id
+  description = "ROSA cluster ID"
+}
+
+output "rosa_api_url" {
+  value       = module.rosa.api_url
+  description = "ROSA API URL"
+}
+
+output "rosa_console_url" {
+  value       = module.rosa.console_url
+  description = "ROSA console URL"
+}
+
+output "oidc_endpoint_url" {
+  value       = module.rosa.oidc_endpoint_url
+  description = "OIDC endpoint URL"
+}
+
+output "bedrock_role_arn" {
+  value       = module.iam_irsa.bedrock_role_arn
+  description = "Bedrock IRSA role ARN"
+}
+
+output "s3_role_arn" {
+  value       = module.iam_irsa.s3_role_arn
+  description = "S3 IRSA role ARN"
+}
+
+output "ecr_role_arn" {
+  value       = module.iam_irsa.ecr_role_arn
+  description = "ECR IRSA role ARN"
+}
+
+output "ssm_role_arn" {
+  value       = module.iam_irsa.ssm_role_arn
+  description = "SSM IRSA role ARN"
+}
 
 # ── Next Steps ────────────────────────────────────────────────────────────────
 output "next_steps" {

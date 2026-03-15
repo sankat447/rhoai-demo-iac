@@ -95,7 +95,7 @@ else
     echo ""
     
     log_ok "Logging in with Red Hat SSO..."
-    if rosa login; then
+    if rosa login --use-auth-code; then
         OCM_EMAIL=$(rosa whoami 2>&1 | grep "OCM Account Email" | awk '{print $NF}')
         log_ok "ROSA authenticated - $OCM_EMAIL"
         

@@ -9,7 +9,7 @@ echo "→ Refreshing AWS SSO token..."
 aws sts get-caller-identity > /dev/null 2>&1 || { echo "Run: aws-login first"; exit 1; }
 
 echo "→ Refreshing ROSA token..."
-rosa login
+rosa login --use-auth-code
 export RHCS_TOKEN=$(rosa token)
 
 echo "→ Running terraform apply..."
