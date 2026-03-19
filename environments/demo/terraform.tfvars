@@ -76,5 +76,5 @@ monthly_budget_usd  = 700
 demo_start_cron = "cron(0 8 ? * MON-FRI *)"
 demo_stop_cron  = "cron(0 20 ? * MON-FRI *)"
 
-oidc_config_id      = "2ovm1pcngkss9e6stmbirbefljiiuptk"
+oidc_config_id      = "2p4ru24skdhahlddjliu19fl90bm9927"
 account_role_prefix = "rhoai-demo"

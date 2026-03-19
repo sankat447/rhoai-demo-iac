@@ -330,16 +330,85 @@ fi
 log_section "STEP 7: AWS PLATFORM TEARDOWN"
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Empty S3 bucket first (with better error handling)
+# Empty S3 bucket first — must delete ALL versions + delete markers for versioned buckets
 S3_BUCKET=$(terraform output -raw s3_bucket_name 2>/dev/null || echo "")
 if [ -n "$S3_BUCKET" ]; then
-    log "Emptying S3 bucket: ${S3_BUCKET}"
-    if aws s3 ls "s3://${S3_BUCKET}" &>/dev/null; then
-        aws s3 rm "s3://${S3_BUCKET}" --recursive 2>&1 | tee -a "${LOG_FILE}" || log_warn "S3 bucket empty failed - may already be empty"
-        log_ok "S3 bucket emptied"
+    log "Emptying S3 bucket (including versioned objects): ${S3_BUCKET}"
+    if aws s3api head-bucket --bucket "${S3_BUCKET}" &>/dev/null; then
+        # Delete all object versions (required for versioned buckets)
+        log "  Deleting all object versions..."
+        aws s3api list-object-versions --bucket "${S3_BUCKET}" --output json \
+          | jq -c '{Objects: [.Versions[]? | {Key:.Key, VersionId:.VersionId}], Quiet: true}' \
+          | while read -r batch; do
+              [[ "$(echo "$batch" | jq '.Objects | length')" -gt 0 ]] && \
+                aws s3api delete-objects --bucket "${S3_BUCKET}" --delete "$batch" 2>&1 | tee -a "${LOG_FILE}"
+            done || true
+
+        # Delete all delete markers
+        log "  Deleting all delete markers..."
+        aws s3api list-object-versions --bucket "${S3_BUCKET}" --output json \
+          | jq -c '{Objects: [.DeleteMarkers[]? | {Key:.Key, VersionId:.VersionId}], Quiet: true}' \
+          | while read -r batch; do
+              [[ "$(echo "$batch" | jq '.Objects | length')" -gt 0 ]] && \
+                aws s3api delete-objects --bucket "${S3_BUCKET}" --delete "$batch" 2>&1 | tee -a "${LOG_FILE}"
+            done || true
+
+        log_ok "S3 bucket emptied (all versions + delete markers)"
     else
-        log_ok "S3 bucket already empty or doesn't exist"
+        log_ok "S3 bucket already deleted or doesn't exist"
     fi
+fi
+
+# ── Clean up VPC dependencies left behind by ROSA ────────────────────────────
+# After ROSA cluster deletion, orphaned ENIs, ELBs, and security groups can
+# prevent VPC deletion. Clean them up before terraform destroy.
+VPC_ID=$(terraform output -raw vpc_id 2>/dev/null || echo "")
+if [ -n "$VPC_ID" ]; then
+    log "Cleaning up orphaned VPC dependencies in ${VPC_ID}..."
+
+    # Delete orphaned ELBs (classic + ALB/NLB)
+    log "  Checking for orphaned load balancers..."
+    for ELB in $(aws elb describe-load-balancers --query "LoadBalancerDescriptions[?VPCId=='${VPC_ID}'].LoadBalancerName" --output text 2>/dev/null); do
+        log "  Deleting classic ELB: ${ELB}"
+        aws elb delete-load-balancer --load-balancer-name "${ELB}" 2>&1 | tee -a "${LOG_FILE}" || true
+    done
+    for ALB_ARN in $(aws elbv2 describe-load-balancers --query "LoadBalancers[?VpcId=='${VPC_ID}'].LoadBalancerArn" --output text 2>/dev/null); do
+        log "  Deleting ALB/NLB: ${ALB_ARN}"
+        aws elbv2 delete-load-balancer --load-balancer-arn "${ALB_ARN}" 2>&1 | tee -a "${LOG_FILE}" || true
+    done
+
+    # Detach and delete orphaned ENIs
+    log "  Checking for orphaned ENIs..."
+    for ENI_ID in $(aws ec2 describe-network-interfaces --filters "Name=vpc-id,Values=${VPC_ID}" --query "NetworkInterfaces[?Status!='in-use'].NetworkInterfaceId" --output text 2>/dev/null); do
+        log "  Deleting ENI: ${ENI_ID}"
+        aws ec2 delete-network-interface --network-interface-id "${ENI_ID}" 2>&1 | tee -a "${LOG_FILE}" || true
+    done
+    # Force-detach any remaining attached ENIs not managed by us
+    for ENI_ID in $(aws ec2 describe-network-interfaces --filters "Name=vpc-id,Values=${VPC_ID}" "Name=status,Values=in-use" --query "NetworkInterfaces[?Attachment.InstanceOwnerId!='amazon-aws'].NetworkInterfaceId" --output text 2>/dev/null); do
+        ATTACH_ID=$(aws ec2 describe-network-interfaces --network-interface-ids "${ENI_ID}" --query "NetworkInterfaces[0].Attachment.AttachmentId" --output text 2>/dev/null)
+        if [ -n "$ATTACH_ID" ] && [ "$ATTACH_ID" != "None" ]; then
+            log "  Force-detaching ENI: ${ENI_ID}"
+            aws ec2 detach-network-interface --attachment-id "${ATTACH_ID}" --force 2>&1 | tee -a "${LOG_FILE}" || true
+            sleep 5
+            aws ec2 delete-network-interface --network-interface-id "${ENI_ID}" 2>&1 | tee -a "${LOG_FILE}" || true
+        fi
+    done
+
+    # Delete non-default security groups
+    log "  Checking for orphaned security groups..."
+    for SG_ID in $(aws ec2 describe-security-groups --filters "Name=vpc-id,Values=${VPC_ID}" --query "SecurityGroups[?GroupName!='default'].GroupId" --output text 2>/dev/null); do
+        log "  Deleting security group: ${SG_ID}"
+        # Remove all ingress/egress rules first (clear dependencies between SGs)
+        aws ec2 revoke-security-group-ingress --group-id "${SG_ID}" --security-group-rule-ids \
+          $(aws ec2 describe-security-group-rules --filters "Name=group-id,Values=${SG_ID}" --query "SecurityGroupRules[?!IsEgress].SecurityGroupRuleId" --output text 2>/dev/null) 2>/dev/null || true
+        aws ec2 revoke-security-group-egress --group-id "${SG_ID}" --security-group-rule-ids \
+          $(aws ec2 describe-security-group-rules --filters "Name=group-id,Values=${SG_ID}" --query "SecurityGroupRules[?IsEgress].SecurityGroupRuleId" --output text 2>/dev/null) 2>/dev/null || true
+        aws ec2 delete-security-group --group-id "${SG_ID}" 2>&1 | tee -a "${LOG_FILE}" || true
+    done
+
+    log_ok "VPC dependency cleanup complete"
+else
+    log_warn "Could not determine VPC ID — skipping VPC dependency cleanup"
 fi
 
 # Refresh token before full destroy — ROSA teardown (Steps 4-6) may have taken 15+ minutes
@@ -389,7 +458,7 @@ fi
 echo ""
 read -rp "Delete OIDC config? (can be reused for future deploys) [y/N]: " delete_oidc
 if [[ "$delete_oidc" =~ ^[Yy]$ ]]; then
-    OIDC_ID=$(terraform output -raw oidc_config_id 2>/dev/null || echo "2ovm1pcngkss9e6stmbirbefljiiuptk")
+    OIDC_ID=$(terraform output -raw oidc_config_id 2>/dev/null || grep 'oidc_config_id' "${ENV_DIR}/terraform.tfvars" 2>/dev/null | awk -F'"' '{print $2}' || echo "")
     log "Deleting OIDC config: ${OIDC_ID}"
     rosa delete oidc-config --oidc-config-id "${OIDC_ID}" --yes 2>&1 | tee -a "${LOG_FILE}" || log_warn "OIDC config deletion had errors"
     log_ok "OIDC config deleted"

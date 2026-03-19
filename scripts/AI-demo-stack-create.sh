@@ -34,7 +34,7 @@ AWS_PROFILE="${AWS_PROFILE:-rhoai-demo}"
 CLUSTER_NAME="rhoai-demo"
 ACCOUNT_ROLE_PREFIX="rhoai-demo"
 AWS_REGION="us-east-1"
-OIDC_CONFIG_ID="2ovm1pcngkss9e6stmbirbefljiiuptk"
+OIDC_CONFIG_ID="2p4ru24skdhahlddjliu19fl90bm9927"
 
 # ── Tracking ──────────────────────────────────────────────────────────────────
 STEPS_PASSED=0
@@ -238,7 +238,61 @@ log_info "Verifying OIDC config ID: ${OIDC_CONFIG_ID}..."
 if rosa list oidc-config 2>&1 | grep -q "$OIDC_CONFIG_ID"; then
   log_ok "OIDC config confirmed — ${OIDC_CONFIG_ID}"
 else
-  log_warn "OIDC config '${OIDC_CONFIG_ID}' not found — verify oidc_config_id in terraform.tfvars"
+  log_warn "OIDC config '${OIDC_CONFIG_ID}' not found — creating a new one..."
+  OIDC_CREATE_OUT=$(rosa create oidc-config --managed --yes --mode auto --region "${AWS_REGION}" 2>&1)
+  NEW_OIDC_ID=$(echo "$OIDC_CREATE_OUT" | grep -oP "oidc-provider/[^/]+/\K[a-z0-9]+" | head -1)
+
+  if [[ -z "$NEW_OIDC_ID" ]]; then
+    # Fallback: grab the newest OIDC config from the list
+    NEW_OIDC_ID=$(rosa list oidc-config 2>/dev/null | tail -1 | awk '{print $1}')
+  fi
+
+  if [[ -n "$NEW_OIDC_ID" ]]; then
+    log_ok "Created new OIDC config: ${NEW_OIDC_ID}"
+
+    # Update the hardcoded ID in this script for current run
+    OLD_OIDC_CONFIG_ID="$OIDC_CONFIG_ID"
+    OIDC_CONFIG_ID="$NEW_OIDC_ID"
+
+    # Persist the new ID into terraform.tfvars and this script
+    sed -i '' "s|oidc_config_id.*=.*\"${OLD_OIDC_CONFIG_ID}\"|oidc_config_id      = \"${NEW_OIDC_ID}\"|" "${ENV_DIR}/terraform.tfvars"
+    log_ok "Updated terraform.tfvars with new OIDC config ID"
+
+    sed -i '' "s|OIDC_CONFIG_ID=\"${OLD_OIDC_CONFIG_ID}\"|OIDC_CONFIG_ID=\"${NEW_OIDC_ID}\"|" "${SCRIPT_DIR}/AI-demo-stack-create.sh"
+    sed -i '' "s|${OLD_OIDC_CONFIG_ID}|${NEW_OIDC_ID}|g" "${SCRIPT_DIR}/AI-demo-stack-destroy.sh"
+    log_ok "Updated script files with new OIDC config ID"
+  else
+    abort "Failed to create OIDC config — check 'rosa create oidc-config' output"
+  fi
+fi
+
+# ── Verify operator role trust policies match the OIDC config ──────────────
+log_info "Checking operator role trust policies match OIDC config..."
+OIDC_MISMATCH=false
+OIDC_ISSUER_URL=$(rosa list oidc-config 2>/dev/null | grep "$OIDC_CONFIG_ID" | awk '{print $3}' | sed 's|https://||')
+
+for ROLE_NAME in $(aws iam list-roles --query "Roles[?starts_with(RoleName, '${ACCOUNT_ROLE_PREFIX}-') && contains(RoleName, '-openshift-') || starts_with(RoleName, '${ACCOUNT_ROLE_PREFIX}-kube-')].RoleName" --output text 2>/dev/null); do
+  TRUST_POLICY=$(aws iam get-role --role-name "$ROLE_NAME" --query "Role.AssumeRolePolicyDocument" --output json 2>/dev/null)
+  if echo "$TRUST_POLICY" | grep -q "oidc" && ! echo "$TRUST_POLICY" | grep -q "$OIDC_CONFIG_ID"; then
+    OIDC_MISMATCH=true
+    OLD_OIDC_IN_ROLE=$(echo "$TRUST_POLICY" | grep -o 'oidc\.op1\.openshiftapps\.com/[a-z0-9]*' | head -1 | awk -F'/' '{print $NF}')
+    if [[ -z "$OLD_OIDC_IN_ROLE" ]]; then
+      OLD_OIDC_IN_ROLE=$(echo "$TRUST_POLICY" | grep -o 'rh-oidc\.s3\.[^/]*/[a-z0-9]*' | head -1 | awk -F'/' '{print $NF}')
+    fi
+    log_warn "Role ${ROLE_NAME} trusts old OIDC: ${OLD_OIDC_IN_ROLE}"
+    if [[ -z "$OLD_OIDC_IN_ROLE" ]]; then
+      log_warn "  Could not extract old OIDC ID from trust policy — skipping ${ROLE_NAME}"
+      continue
+    fi
+    NEW_TRUST=$(echo "$TRUST_POLICY" | sed "s|${OLD_OIDC_IN_ROLE}|${OIDC_CONFIG_ID}|g")
+    aws iam update-assume-role-policy --role-name "$ROLE_NAME" --policy-document "$NEW_TRUST" 2>/dev/null \
+      && log_ok "  Updated trust policy for ${ROLE_NAME}" \
+      || log_warn "  Failed to update trust policy for ${ROLE_NAME}"
+  fi
+done
+
+if [[ "$OIDC_MISMATCH" == "false" ]]; then
+  log_ok "All operator roles trust the correct OIDC provider"
 fi
 
 # =============================================================================
@@ -369,6 +423,10 @@ run_apply_with_retry() {
           log_warn "AWS SSO also expired — refreshing..."
           aws sso login --profile "$AWS_PROFILE"
         }
+        # Re-plan to avoid "Saved plan is stale" error after partial apply
+        log_info "Re-generating plan after token refresh..."
+        terraform plan -out=tfplan -var "rhcs_token=${RHCS_TOKEN}" 2>&1 | tail -5
+        log_ok "Plan refreshed"
         attempt=$(( attempt + 1 ))
         continue
       else

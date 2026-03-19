@@ -12,8 +12,9 @@ locals {
 
 # ── Main Data Bucket ──────────────────────────────────────────────────────────
 resource "aws_s3_bucket" "main" {
-  bucket = local.bucket_name
-  tags   = merge(var.tags, { Name = local.bucket_name, Purpose = "rhoai-data-lake" })
+  bucket        = local.bucket_name
+  force_destroy = true   # Allow terraform destroy to delete bucket even with versioned objects
+  tags          = merge(var.tags, { Name = local.bucket_name, Purpose = "rhoai-data-lake" })
 }
 
 resource "aws_s3_bucket_versioning" "main" {
